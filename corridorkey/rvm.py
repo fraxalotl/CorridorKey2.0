@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .device import sdpa
+
 
 # ---------------------------------------------------------------------------
 # Model configs (from ckpt inspection)
@@ -147,8 +149,8 @@ class _MHA(nn.Module):
             *lead, L, _ = x.shape
             return x.view(*lead, L, self.num_heads, self.head_dim).transpose(-3, -2)
         q = split_heads(q); k = split_heads(k); v = split_heads(v)
-        # Use flash SDPA for speed / memory.
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # Fused SDPA on CUDA; bounded-memory chunked SDPA on MPS.
+        attn = sdpa(q, k, v, dropout_p=0.0, is_causal=False)
         # (..., H, Lq, D) → (..., Lq, H, D) → (..., Lq, H·D)
         attn = attn.transpose(-3, -2).contiguous()
         attn = attn.reshape(*attn.shape[:-2], self.inner_dim)
@@ -550,7 +552,7 @@ def load_rvm_npz(model: RVMVideoSiamMAE, npz_path: str,
 
 
 def build_rvm(variant: str = 'small', ckpt_path: Optional[str] = None,
-               device: str = 'cuda') -> RVMVideoSiamMAE:
+               device: str = 'cpu') -> RVMVideoSiamMAE:
     """Build a frozen RVM model and optionally load weights from NPZ."""
     model = RVMVideoSiamMAE(variant=variant).to(device)
     if ckpt_path is not None:

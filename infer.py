@@ -7,11 +7,12 @@ import tempfile
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Must be set before torch loads: run ops Metal lacks on the CPU instead of failing.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from pathlib import Path
 
-import torch
-
+from corridorkey.device import resolve_device
 from corridorkey.runtime import (
     InferenceConfig,
     RuntimePaths,
@@ -49,6 +50,9 @@ def main():
     ap.add_argument("--input", required=True,
                     help="Input video file or directory of image frames.")
     ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--device", default="auto",
+                    help="Compute device: auto (Apple Silicon GPU, then CUDA, "
+                         "then CPU), mps, cuda, or cpu. Default: auto.")
     ap.add_argument("--weights", default=None,
                     help="Runtime checkpoint (.safetensors or legacy .pt). "
                          "Defaults to weights/corridorkey_v2.safetensors.")
@@ -61,7 +65,7 @@ def main():
     ap.add_argument("--no_carry_hint", action="store_true")
     ap.add_argument("--hann_chunk", type=int, default=None,
                     help="Frames per stage-1 window. Default: chosen "
-                         "automatically from free GPU memory.")
+                         "automatically from free GPU / unified memory.")
     ap.add_argument("--hann_stride", type=int, default=None,
                     help="Frames between stage-1 windows. Default: half of "
                          "--hann_chunk.")
@@ -99,7 +103,13 @@ def main():
     ap.add_argument("--exr_dtype", choices=("half", "float"), default="half",
                     help="EXR pixel type for --output_format exr. Default: half.")
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
-    ap.add_argument("--ffmpeg_codec", default="libx264")
+    ap.add_argument("--ffmpeg_codec", default="libx264",
+                    help="Encoder for alpha/fg/checker. On macOS, "
+                         "hevc_videotoolbox or h264_videotoolbox use the Apple "
+                         "media engine (rate set by --bitrate or --vt_quality).")
+    ap.add_argument("--vt_quality", type=int, default=80,
+                    help="VideoToolbox constant quality 1-100 when no "
+                         "--bitrate is given. Default: 80.")
     ap.add_argument("--crf", type=int, default=12)
     ap.add_argument("--preset", default="medium")
     ap.add_argument("--pix_fmt", default="yuv444p10le",
@@ -117,8 +127,10 @@ def main():
                     default=2048)
     args = ap.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
+    device = resolve_device(args.device)
+    if device.type == "cpu":
+        print("[WARNING] No GPU found (Apple Silicon MPS or CUDA). Running on the "
+              "CPU, which is extremely slow.")
     require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
@@ -130,6 +142,7 @@ def main():
         pix_fmt=args.pix_fmt,
         bitrate=args.bitrate,
         threads=args.ffmpeg_threads,
+        vt_quality=args.vt_quality,
     )
     # With no explicit memory settings, pick them per clip from free GPU memory.
     auto_vram = args.hann_chunk is None and args.hann_stride is None and not args.low_vram
@@ -166,7 +179,7 @@ def main():
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
     )
-    model = load_model(paths, device="cuda")
+    model = load_model(paths, device=device)
     run_inference(
         model,
         args.input,

@@ -6,7 +6,9 @@ import os
 import sys
 from pathlib import Path
 
-import torch
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import torch  # noqa: E402
 
 
 def main():
@@ -38,9 +40,8 @@ def main():
     print(f"checkpoint ok: {paths.weights} ({paths.weights.stat().st_size / 1e9:.2f} GB)")
     print(f"state tensors: {len(state)}")
     if args.load_model:
-        if not torch.cuda.is_available():
-            raise RuntimeError("--load_model requires CUDA")
-        model = load_model(paths, device="cuda")
+        from corridorkey.device import resolve_device
+        model = load_model(paths, device=resolve_device("auto"))
         print(f"model ok: d16={model.stage1.d_16}, "
               f"cradio={model.stage1.cradio_dim}, "
               f"moge={model.stage1.moge_dim}, "

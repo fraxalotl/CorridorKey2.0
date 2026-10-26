@@ -28,6 +28,8 @@ class WriterConfig:
     pix_fmt: str = "yuv444p10le"
     bitrate: str | None = None
     threads: int = 2
+    # VideoToolbox (macOS hardware encoder) constant quality, 1-100.
+    vt_quality: int = 80
 
 
 def require_ffmpeg(ffmpeg_bin: str) -> None:
@@ -640,6 +642,21 @@ class ThreadedVideoWriter:
                 "-profile:v", "4",
                 "-pix_fmt", "yuva444p10le"
             ])
+        elif self.cfg.codec.endswith("_videotoolbox"):
+            # Apple media-engine encoders take no x264 preset/crf; they use a
+            # target bitrate or a constant-quality value.
+            pix_fmt = self.cfg.pix_fmt
+            if pix_fmt.startswith("yuv444"):
+                # VideoToolbox has no 4:4:4 planar input; use its native
+                # 4:2:0 formats (10-bit for HEVC, 8-bit for H.264).
+                pix_fmt = "p010le" if self.cfg.codec.startswith("hevc") else "nv12"
+            cmd.extend(["-c:v", self.cfg.codec, "-pix_fmt", pix_fmt])
+            if self.cfg.codec.startswith("hevc"):
+                cmd.extend(["-tag:v", "hvc1"])
+            if self.cfg.bitrate:
+                cmd.extend(["-b:v", self.cfg.bitrate])
+            else:
+                cmd.extend(["-q:v", str(int(self.cfg.vt_quality))])
         else:
             cmd.extend([
                 "-c:v", self.cfg.codec,

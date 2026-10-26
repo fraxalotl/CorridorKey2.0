@@ -18,7 +18,11 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 
 ## Setup
 
-You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
+CorridorKey runs on Apple Silicon Macs (M1 or newer, through PyTorch's Metal
+backend) or on NVIDIA GPUs. For the Mac, see
+[Apple Silicon (macOS)](#apple-silicon-macos) below.
+
+On Windows/Linux you need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
 environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
 This package was tested with:
@@ -50,6 +54,55 @@ The download script fetches:
 
 After that everything loads from those local folders.
 
+### Apple Silicon (macOS)
+
+Requirements: an M-series Mac, macOS 14 (Sonoma) or newer, Python 3.10+, and
+16 GB of unified memory or more (32 GB+ recommended for 4K). From the
+repository root run:
+
+```
+bash scripts/setup_macos.sh
+```
+
+This checks the machine, installs `ffmpeg` with Homebrew if it is missing,
+creates `venv/`, installs PyTorch (the standard macOS wheels include Metal
+support) plus the requirements, and downloads the weights. To do the same by
+hand:
+
+```
+brew install ffmpeg
+python3 -m venv venv
+source venv/bin/activate
+pip install torch==2.9.1 torchvision==0.24.1
+pip install -r requirements.txt
+python scripts/download_weights.py
+```
+
+How the Mac build differs from the CUDA build:
+
+- The device is picked automatically (`--device auto`: Apple GPU, then CUDA,
+  then CPU). Force one with `--device mps|cuda|cpu`.
+- The network runs in bfloat16 on the GPU, the same precision as on CUDA.
+  Any operator Metal does not implement falls back to the CPU automatically
+  (`PYTORCH_ENABLE_MPS_FALLBACK=1` is set for you).
+- Metal has no flash-attention kernel, so large attention calls are split
+  into exact chunks to bound memory. The per-call budget defaults to 1 GB;
+  set `CORRIDORKEY_MPS_ATTN_BUDGET_MB` to change it (higher can be faster on
+  machines with lots of memory).
+- Automatic window selection uses Metal's recommended working-set size and
+  the RAM currently free (other apps share unified memory), with extra
+  headroom because the memory table below was measured on CUDA. Close
+  memory-hungry apps before long 4K renders.
+- GPU and CPU share memory on Apple Silicon, so idle models are not moved
+  to the CPU between phases (doing so frees nothing). `--low_vram` still
+  lowers peak memory, because it reduces activation size.
+- For faster preview encodes you can use Apple's media engine:
+  `--ffmpeg_codec hevc_videotoolbox` (10-bit 4:2:0) or `h264_videotoolbox`,
+  with `--vt_quality 1-100` or `--bitrate`. The default `libx264` 4:4:4
+  output is unchanged.
+- Expect it to be slower than a recent high-end NVIDIA card. Start with a
+  short test (`--num_frames 24`) to get a feel for speed on your machine.
+
 ## Drag-And-Drop Launcher
 
 The easiest way to run CorridorKey is to drag a clip, a frame-sequence folder,
@@ -58,6 +111,10 @@ or a folder of clips onto the launcher in the repository root:
 - **Windows:** `CorridorKey_DRAG_CLIPS_HERE.bat`
 - **Linux:** `CorridorKey_DRAG_CLIPS_HERE.sh` (or run it in a terminal and drop
   the clip into the terminal when asked)
+- **macOS:** double-click `CorridorKey_DRAG_CLIPS_HERE.command`. Terminal
+  opens; drag the clip into the Terminal window when asked. (Finder does not
+  pass dropped files to scripts, so dropping onto the icon itself does not
+  work.) If macOS blocks it the first time, right-click it and choose Open.
 
 It walks you through the inference mode, outputs, and GPU memory profile, then
 runs the job. The launcher uses the `venv` created during setup if it exists.
