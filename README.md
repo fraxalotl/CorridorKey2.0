@@ -71,6 +71,13 @@ You can also start the same guided session directly:
 python run_interactive.py /path/to/clip.mp4
 ```
 
+## DaVinci Resolve / Fusion Node
+
+`resolve/` contains a Fusion node for DaVinci Resolve with an optional alpha
+hint input. After setup, install it with `resolve\Install_Resolve_Plugin.bat`
+(or `venv\Scripts\python resolve\install_resolve_plugin.py`) and restart
+Resolve. See [resolve/README.md](resolve/README.md) for usage.
+
 ## Quick Start
 
 From the repository root:

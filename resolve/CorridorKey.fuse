@@ -1,0 +1,1016 @@
+--[[
+CorridorKey for DaVinci Resolve / Fusion
+
+A Fusion node that keys a whole shot with the CorridorKey 2.0 neural keyer.
+
+CorridorKey looks at many frames at once, so it cannot key one frame at a
+time inside Process() like an ordinary node. Instead:
+
+  1. "Process Shot" exports every frame of the comp's render range (plus the
+     optional Alpha Hint input) into a cache folder.
+  2. A background Python process (resolve/corridorkey_resolve_bridge.py in
+     the CorridorKey folder) keys the shot on the GPU and writes one result
+     file per frame.
+  3. The node then shows the cached result for each frame, with despill and
+     output options applied live on the GPU (no re-processing needed).
+
+Frames are exchanged as raw half-float RGBA files with bottom-up rows, which
+is Fusion's native layout, so export and import are plain memory copies.
+
+Install with resolve/install_resolve_plugin.py, which fills in the two paths
+below. They can also be changed per node under "Help & Support > Setup".
+]]
+
+local CK_VERSION = "1.0.0"
+local CK_DEFAULT_ROOT = [[@@CK_ROOT@@]]
+local CK_DEFAULT_PYTHON = [[@@CK_PYTHON@@]]
+
+local ffi = require("ffi")
+
+FuRegisterClass("CorridorKey", CT_Tool, {
+	REGS_Name = "CorridorKey",
+	REGS_Category = "Fuses\\Keying",
+	REGS_OpIconString = "CKy",
+	REGS_OpDescription = "CorridorKey 2.0 neural green screen keyer",
+	REGS_Company = "Corridor Digital",
+	REGS_URL = "https://github.com/nikopueringer/CorridorKey2.0",
+	REG_NoMotionBlurCtrls = true,
+	REG_NoObjMatCtrls = true,
+	REG_OpNoMask = true,
+	REG_Fuse_NoEdit = false,
+	REG_Fuse_NoReload = false,
+	REG_Version = 100,
+})
+
+local IS_WINDOWS = jit.os == "Windows"
+local RAW_EXT = ".ckraw"
+
+local RESOLUTIONS = { { "Full", 1.0 }, { "Half", 0.5 }, { "Quarter", 0.25 } }
+local MEMORY_MODES = { { "Auto", "auto" }, { "Low VRAM", "low" }, { "High VRAM", "high" } }
+local HINT_MODES = { { "Off", "off" }, { "First Frame Only", "first" }, { "Every Frame", "every" } }
+local OUTPUT_MODES = {
+	"Premultiplied Key",
+	"Straight Foreground",
+	"Matte",
+	"Original + Matte",
+	"Raw Foreground",
+}
+
+-- ---------------------------------------------------------------------------
+-- Small helpers
+-- ---------------------------------------------------------------------------
+
+local function placeholder(s)
+	return s == nil or s == "" or s:find("@@", 1, true) ~= nil
+end
+
+local function join(...)
+	local parts = { ... }
+	local p = table.concat(parts, "/")
+	p = p:gsub("[/\\]+", "/")
+	return p
+end
+
+local function native(p)
+	if IS_WINDOWS then
+		return (p:gsub("/", "\\"))
+	end
+	return p
+end
+
+local function quote(p)
+	return '"' .. native(p) .. '"'
+end
+
+local function default_cache_folder()
+	if IS_WINDOWS then
+		local base = os.getenv("LOCALAPPDATA") or os.getenv("TEMP") or "C:/Temp"
+		return join(base, "CorridorKey", "ResolveCache")
+	elseif jit.os == "OSX" then
+		return join(os.getenv("HOME") or "/tmp", "Library", "Caches", "CorridorKey")
+	end
+	return join(os.getenv("HOME") or "/tmp", ".cache", "CorridorKey")
+end
+
+local function default_python(root)
+	if not placeholder(CK_DEFAULT_PYTHON) then
+		return CK_DEFAULT_PYTHON
+	end
+	if root == "" then
+		return IS_WINDOWS and "pythonw.exe" or "python3"
+	end
+	if IS_WINDOWS then
+		local pyw = join(root, "venv", "Scripts", "pythonw.exe")
+		if bmd.fileexists(pyw) then
+			return pyw
+		end
+		return join(root, "venv", "Scripts", "python.exe")
+	end
+	return join(root, "venv", "bin", "python")
+end
+
+local function sanitize(s)
+	return (tostring(s):gsub("[^%w%-_]", "_"))
+end
+
+local function read_kv(path)
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local t = {}
+	for line in f:lines() do
+		local k, v = line:match("^([%w_]+)=(.*)$")
+		if k then
+			t[k] = v:gsub("\r$", "")
+		end
+	end
+	f:close()
+	return t
+end
+
+local function write_text(path, text)
+	local f = io.open(path, "w")
+	if not f then
+		return false
+	end
+	f:write(text)
+	f:close()
+	return true
+end
+
+local function json_value(v)
+	local ty = type(v)
+	if ty == "string" then
+		return '"' .. v:gsub('[%c"\\]', function(c)
+			if c == '"' then return '\\"' end
+			if c == "\\" then return "\\\\" end
+			if c == "\n" then return "\\n" end
+			return string.format("\\u%04x", c:byte())
+		end) .. '"'
+	elseif ty == "boolean" then
+		return v and "true" or "false"
+	elseif ty == "number" then
+		if v == math.floor(v) and math.abs(v) < 1e15 then
+			return string.format("%d", v)
+		end
+		return string.format("%.6g", v)
+	end
+	return "null"
+end
+
+local function json_object(t, keys)
+	local out = {}
+	for _, k in ipairs(keys) do
+		if t[k] ~= nil then
+			out[#out + 1] = "  " .. json_value(k) .. ": " .. json_value(t[k])
+		end
+	end
+	return "{\n" .. table.concat(out, ",\n") .. "\n}\n"
+end
+
+local function remove_files(dir, pattern)
+	local entries = bmd.readdir(join(dir, pattern))
+	if not entries then
+		return
+	end
+	for _, e in ipairs(entries) do
+		if not e.IsDir then
+			os.remove(join(dir, e.Name))
+		end
+	end
+end
+
+local function folder_size(dir)
+	local total = 0
+	local entries = bmd.readdir(join(dir, "*"))
+	if not entries then
+		return 0
+	end
+	for _, e in ipairs(entries) do
+		if e.IsDir then
+			total = total + folder_size(join(dir, e.Name))
+		else
+			total = total + (tonumber(e.Size) or 0)
+		end
+	end
+	return total
+end
+
+local function format_bytes(n)
+	if n >= 2 ^ 30 then
+		return string.format("%.1f GB", n / 2 ^ 30)
+	elseif n >= 2 ^ 20 then
+		return string.format("%.0f MB", n / 2 ^ 20)
+	end
+	return string.format("%.0f KB", n / 2 ^ 10)
+end
+
+local function open_external(path)
+	if IS_WINDOWS then
+		bmd.executebg("explorer.exe " .. quote(path))
+	elseif jit.os == "OSX" then
+		bmd.executebg("/usr/bin/open " .. quote(path))
+	else
+		bmd.executebg("xdg-open " .. quote(path))
+	end
+end
+
+-- Peak GPU memory in GiB by model megapixels and Hann window size, from
+-- corridorkey/runtime.py (_VRAM_PEAK_GB). Used for the estimate display only;
+-- the bridge makes the real choice from free memory at run time.
+local VRAM_PEAK = {
+	[false] = { { 8, 24, 48, 80 }, {
+		{ 0.98, { 6.19, 7.52, 9.77, 12.89 } },
+		{ 2.21, { 7.50, 11.33, 18.66, 24.89 } },
+		{ 3.93, { 9.06, 14.78, 23.92, 33.19 } },
+		{ 8.36, { 13.94, 25.96, 45.15, 70.45 } },
+	} },
+	[true] = { { 1, 2, 4, 8, 24, 48, 80 }, {
+		{ 0.98, { 2.71, 2.78, 2.94, 3.25, 4.54, 6.57, 9.50 } },
+		{ 2.21, { 2.80, 2.97, 3.35, 4.12, 7.69, 13.20, 20.56 } },
+		{ 3.93, { 2.92, 3.23, 3.85, 5.09, 10.09, 17.57, 27.75 } },
+		{ 8.36, { 3.25, 3.92, 5.28, 8.38, 20.78, 39.66, 64.65 } },
+	} },
+}
+
+local function interp(x, pts)
+	for i = 1, #pts - 1 do
+		local x0, y0, x1, y1 = pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2]
+		if x <= x1 or i == #pts - 1 then
+			return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+		end
+	end
+	return pts[1][2]
+end
+
+local function estimate_vram(width, height, scale, frames, low_vram)
+	local q = 128
+	local h = math.ceil(math.floor(height * scale + 0.5) / q) * q
+	local w = math.ceil(math.floor(width * scale + 0.5) / q) * q
+	local mp = w * h / 1e6
+	local chunks, rows = VRAM_PEAK[low_vram][1], VRAM_PEAK[low_vram][2]
+	frames = math.max(frames, chunks[1])
+	local per_chunk = {}
+	for i = 1, #chunks do
+		local pts = {}
+		for _, row in ipairs(rows) do
+			pts[#pts + 1] = { row[1], row[2][i] }
+		end
+		per_chunk[#per_chunk + 1] = { chunks[i], math.max(interp(mp, pts), rows[1][2][i]) }
+	end
+	return interp(frames, per_chunk)
+end
+
+-- ---------------------------------------------------------------------------
+-- GPU kernel: despill, matte levels and output mode
+-- ---------------------------------------------------------------------------
+
+CKOutputParams = [[
+	int size[2];
+	int mode;
+	int despillBlue;
+	int despillAlgo;
+	float despillAmount;
+	float blackPoint;
+	float whitePoint;
+	int compOrder;
+]]
+
+CKOutputKernel = [[
+__DEVICE__ float3 ck_despill(float3 c, int blue, int algo, float strength)
+{
+	if (strength <= 0.0f) return c;
+	float spill = blue ? c.z : c.y;
+	float o1 = c.x;
+	float o2 = blue ? c.y : c.z;
+	float limit;
+	if (algo == 1) limit = _fmaxf(o1, o2);
+	else if (algo == 2) limit = _fminf(o1, o2);
+	else limit = 0.5f * (o1 + o2);
+	float amount = _fmaxf(spill - limit, 0.0f) * strength;
+	spill -= amount;
+	o1 += 0.5f * amount;
+	o2 += 0.5f * amount;
+	if (blue) return make_float3(o1, o2, spill);
+	return make_float3(o1, spill, o2);
+}
+
+__KERNEL__ void CKOutputKernel(__CONSTANTREF__ CKOutputParams *params,
+	__TEXTURE2D__ res, __TEXTURE2D__ src, __TEXTURE2D_WRITE__ dst)
+{
+	DEFINE_KERNEL_ITERATORS_XY(x, y)
+	if (x < params->size[0] && y < params->size[1])
+	{
+		float4 k = _tex2DVecN(res, x, y, params->compOrder);
+		float range = _fmaxf(params->whitePoint - params->blackPoint, 0.00001f);
+		float a = _saturatef((k.w - params->blackPoint) / range);
+		float4 o;
+		if (params->mode == 2) {
+			o = make_float4(a, a, a, 1.0f);
+		} else if (params->mode == 3) {
+			float4 s = _tex2DVecN(src, x, y, params->compOrder);
+			float3 c = ck_despill(make_float3(s.x, s.y, s.z), params->despillBlue, params->despillAlgo, params->despillAmount);
+			o = make_float4(c.x * a, c.y * a, c.z * a, a);
+		} else {
+			float3 c = ck_despill(make_float3(k.x, k.y, k.z), params->despillBlue, params->despillAlgo, params->despillAmount);
+			if (params->mode == 0) o = make_float4(c.x * a, c.y * a, c.z * a, a);
+			else if (params->mode == 1) o = make_float4(c.x, c.y, c.z, a);
+			else o = make_float4(c.x, c.y, c.z, 1.0f);
+		}
+		_tex2DVec4Write(dst, x, y, o);
+	}
+}
+]]
+
+-- ---------------------------------------------------------------------------
+-- Controls
+-- ---------------------------------------------------------------------------
+
+function Create()
+	local function display(name, id, lines)
+		return self:AddInput(name, id, {
+			LINKID_DataType = "Text",
+			INPID_InputControl = "TextEditControl",
+			TEC_Lines = lines or 1,
+			TEC_Wrap = true,
+			TEC_ReadOnly = true,
+			INPS_DefaultText = "-",
+			INP_External = false,
+			INP_Passive = true,
+		})
+	end
+
+	local function button(name, id)
+		return self:AddInput(name, id, {
+			LINKID_DataType = "Number",
+			INPID_InputControl = "ButtonControl",
+			INP_DoNotifyChanged = true,
+			INP_External = false,
+			INP_Passive = true,
+		})
+	end
+
+	local function combo(name, id, items, default)
+		local attrs = {
+			LINKID_DataType = "Number",
+			INPID_InputControl = "ComboControl",
+			INP_Default = default or 0,
+			INP_Integer = true,
+		}
+		for _, item in ipairs(items) do
+			attrs[#attrs + 1] = { CCS_AddString = type(item) == "table" and item[1] or item }
+		end
+		return self:AddInput(name, id, attrs)
+	end
+
+	local function slider(name, id, default, lo, hi, attrs)
+		local a = {
+			LINKID_DataType = "Number",
+			INPID_InputControl = "SliderControl",
+			INP_Default = default,
+			INP_MinScale = lo,
+			INP_MaxScale = hi,
+			INP_MinAllowed = lo,
+			INP_MaxAllowed = hi,
+		}
+		for k, v in pairs(attrs or {}) do
+			a[k] = v
+		end
+		return self:AddInput(name, id, a)
+	end
+
+	local function checkbox(name, id, default)
+		return self:AddInput(name, id, {
+			LINKID_DataType = "Number",
+			INPID_InputControl = "CheckboxControl",
+			INP_Integer = true,
+			INP_Default = default or 0,
+		})
+	end
+
+	self:BeginControlNest("Status", "StatusNest", true, {})
+	InStatus = display("Status", "Status", 2)
+	InVRAM = display("Estimated VRAM", "EstimatedVRAM")
+	InReload = button("Reload Results", "ReloadResults")
+	self:EndControlNest()
+
+	self:BeginControlNest("Controls", "ControlsNest", true, {})
+	InLinear = checkbox("Input is Linear?", "InputLinear", 0)
+	InLinearGuess = display("Linear Guess", "LinearGuess")
+	InResolution = combo("Internal Resolution", "InternalResolution", RESOLUTIONS, 0)
+	InMemory = combo("GPU Memory Limit", "GPUMemoryLimit", MEMORY_MODES, 0)
+	InCacheFolder = self:AddInput("Cache Folder", "CacheFolder", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "FileControl",
+		FC_PathBrowse = true,
+		INPS_DefaultText = default_cache_folder(),
+		INP_DoNotifyChanged = true,
+	})
+	InCacheSize = display("Cache Folder Size", "CacheFolderSize")
+	InOpenCache = button("Open Cache Folder", "OpenCacheFolder")
+	InTemporal = slider("Temporal Awareness", "TemporalAwareness", 24, 1, 80, { INP_Integer = true })
+	InProcessed = display("Processed Shot", "ProcessedShot", 2)
+	InProcess = button("Process Shot", "ProcessShot")
+	InCancel = button("Cancel Pass", "CancelPass")
+	self:EndControlNest()
+
+	self:BeginControlNest("Alpha Hint", "AlphaHintNest", false, {})
+	InHintMode = combo("Hint Mode", "HintMode", HINT_MODES, 2)
+	InHintChannel = combo("Hint Channel", "HintChannel", { "Alpha", "Luminance" }, 0)
+	InHintInvert = checkbox("Invert Hint", "HintInvert", 0)
+	InHintQuality = slider("Hint Quality", "HintQuality", 0.95, 0.0, 1.0)
+	InCarryHint = checkbox("Carry Hint Between Windows", "CarryHint", 1)
+	InCarryQuality = slider("Carry Hint Quality", "CarryHintQuality", 0.95, 0.0, 1.0)
+	self:EndControlNest()
+
+	self:BeginControlNest("Output", "OutputNest", false, {})
+	InOutput = combo("Output", "OutputMode", OUTPUT_MODES, 0)
+	InBlack = slider("Matte Black Point", "MatteBlack", 0.0, 0.0, 1.0)
+	InWhite = slider("Matte White Point", "MatteWhite", 1.0, 0.0, 1.0)
+	self:EndControlNest()
+
+	self:BeginControlNest("Despill", "DespillNest", false, {})
+	InDespillColour = combo("Despill colour", "DespillColour", { "Auto", "Green", "Blue" }, 0)
+	InFreeze = button("Freeze Auto Colour", "FreezeAutoColour")
+	InDespillAlgo = combo("Despill algorithm", "DespillAlgorithm",
+		{ "Average", "Maximum (gentle)", "Minimum (strong)" }, 0)
+	InDespillAmount = slider("Despill amount", "DespillAmount", 0.0, 0.0, 1.0)
+	self:EndControlNest()
+
+	self:BeginControlNest("Help & Support", "HelpNest", false, {})
+	self:AddInput("CorridorKey " .. CK_VERSION .. " for Fusion", "VersionLabel", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "LabelControl",
+		INP_External = false,
+		INP_Passive = true,
+	})
+	InOpenLog = button("Open Log", "OpenLog")
+	InOpenDocs = button("Open Documentation", "OpenDocs")
+	InRoot = self:AddInput("CorridorKey Folder", "CorridorKeyFolder", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "FileControl",
+		FC_PathBrowse = true,
+		INPS_DefaultText = placeholder(CK_DEFAULT_ROOT) and "" or CK_DEFAULT_ROOT,
+	})
+	InPython = self:AddInput("Python", "PythonExecutable", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "FileControl",
+		INPS_DefaultText = "",
+	})
+	InTestMode = checkbox("Pipeline Test Mode (no AI)", "TestMode", 0)
+	self:EndControlNest()
+
+	-- Hidden state. ShotID names this node's cache; ProcessRequest and
+	-- ResultStamp only exist to make Fusion re-render the node.
+	InShotID = self:AddInput("Shot ID", "ShotID", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "TextEditControl",
+		INPS_DefaultText = "",
+		IC_Visible = false,
+		INP_External = false,
+		INP_Passive = true,
+	})
+	InProcessReq = self:AddInput("Process Request", "ProcessRequest", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_Default = 0,
+		INP_Integer = true,
+		IC_Visible = false,
+		INP_External = false,
+	})
+	InResultStamp = self:AddInput("Result Stamp", "ResultStamp", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_Default = 0,
+		IC_Visible = false,
+		INP_External = false,
+	})
+
+	InImage = self:AddInput("Input", "Input", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+	InHint = self:AddInput("Alpha Hint", "AlphaHint", {
+		LINKID_DataType = "Image",
+		LINK_Main = 2,
+		INP_Required = false,
+	})
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+end
+
+function OnAddToFlow()
+	if InShotID:GetSource(0).Value == "" then
+		InShotID:SetSource(Text(bmd.createuuid():gsub("[^%w]", ""):sub(1, 12)), 0, 0)
+	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Shot context: where this node's files live, and the settings to send
+-- ---------------------------------------------------------------------------
+
+local function tool_name(tool)
+	local ok, name = pcall(function() return tool.Name end)
+	return ok and name or "CorridorKey"
+end
+
+local function context(tool, time)
+	local ctx = {}
+	ctx.cache_root = InCacheFolder:GetSource(time).Value
+	if ctx.cache_root == "" then
+		ctx.cache_root = default_cache_folder()
+	end
+	ctx.cache_root = ctx.cache_root:gsub("[/\\]+$", "")
+	ctx.tool_name = tool_name(tool)
+	ctx.shot_id = InShotID:GetSource(time).Value
+	local key = sanitize(ctx.tool_name)
+	if ctx.shot_id ~= "" then
+		key = key .. "_" .. ctx.shot_id
+	end
+	ctx.shot = join(ctx.cache_root, key)
+	ctx.root = InRoot:GetSource(time).Value:gsub("[/\\]+$", "")
+	ctx.python = InPython:GetSource(time).Value
+	if ctx.python == "" then
+		ctx.python = default_python(ctx.root)
+	end
+	return ctx
+end
+
+local function settings(req)
+	local s = {}
+	s.input_linear = InLinear:GetValue(req).Value > 0.5
+	s.model_scale = RESOLUTIONS[InResolution:GetValue(req).Value + 1][2]
+	s.memory_mode = MEMORY_MODES[InMemory:GetValue(req).Value + 1][2]
+	s.temporal = math.floor(InTemporal:GetValue(req).Value + 0.5)
+	s.hint_mode = HINT_MODES[InHintMode:GetValue(req).Value + 1][2]
+	s.hint_channel = InHintChannel:GetValue(req).Value > 0.5 and "luma" or "alpha"
+	s.hint_invert = InHintInvert:GetValue(req).Value > 0.5
+	s.hint_quality = InHintQuality:GetValue(req).Value
+	s.carry_hint = InCarryHint:GetValue(req).Value > 0.5
+	s.carry_hint_quality = InCarryQuality:GetValue(req).Value
+	s.test_mode = InTestMode:GetValue(req).Value > 0.5
+	return s
+end
+
+-- Settings that change the keyed result. A mismatch with the cached run
+-- means the shot needs processing again.
+local function signature(s, first, last, width, height, hint_connected)
+	local hint = "off"
+	if hint_connected and s.hint_mode ~= "off" then
+		hint = string.format("%s/%s/%d/%.3f", s.hint_mode, s.hint_channel,
+			s.hint_invert and 1 or 0, s.hint_quality)
+	end
+	return string.format("v1|%d-%d|%dx%d|lin%d|scale%.2f|%s|t%d|%s|carry%d/%.3f|test%d",
+		first, last, width, height, s.input_linear and 1 or 0, s.model_scale,
+		s.memory_mode, s.temporal, hint, s.carry_hint and 1 or 0,
+		s.carry_hint_quality, s.test_mode and 1 or 0)
+end
+
+-- ---------------------------------------------------------------------------
+-- Raw frame exchange
+-- ---------------------------------------------------------------------------
+
+local function img_attr(img, key, default)
+	local ok, v = pcall(function() return img[key] end)
+	if ok and v ~= nil then
+		return v
+	end
+	return default
+end
+
+local function new_image(width, height, depth, like)
+	return Image({
+		IMG_Document = self.Comp,
+		IMG_Width = width,
+		IMG_Height = height,
+		IMG_XScale = img_attr(like, "XScale", 1.0),
+		IMG_YScale = img_attr(like, "YScale", 1.0),
+		IMG_Depth = depth,
+		IMG_Quality = true,
+		IMG_CopyChannels = false,
+		{ IMG_Channel = "Red" },
+		{ IMG_Channel = "Green" },
+		{ IMG_Channel = "Blue" },
+		{ IMG_Channel = "Alpha" },
+	})
+end
+
+local function check_half_layout(img)
+	local off = img:GetChanOffset()
+	if img.PixelSize ~= 8 or off[0] ~= 0 or off[1] ~= 2 or off[2] ~= 4 or off[3] ~= 6 then
+		error("unexpected Fusion pixel layout (pixel size " .. tostring(img.PixelSize) .. ")")
+	end
+end
+
+local function to_half_rgba(src)
+	local img = new_image(src.Width, src.Height, 7, src)
+	img:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 }))
+	src:Crop(img, { CROP_XOffset = 0, CROP_YOffset = 0 })
+	return img
+end
+
+local function write_raw(src, path)
+	local img = to_half_rgba(src)
+	check_half_layout(img)
+	local f = io.open(path, "wb")
+	if not f then
+		error("cannot write " .. path)
+	end
+	local rows = img:GetScanLine()
+	local row_bytes = img.Width * 8
+	for y = 0, img.Height - 1 do
+		f:write(ffi.string(rows[y], row_bytes))
+	end
+	f:close()
+end
+
+local function read_raw(path, width, height, like)
+	local f = io.open(path, "rb")
+	if not f then
+		return nil
+	end
+	local data = f:read("*a")
+	f:close()
+	local row_bytes = width * 8
+	if #data ~= row_bytes * height then
+		return nil
+	end
+	local img = new_image(width, height, 7, like)
+	check_half_layout(img)
+	local rows = img:GetScanLine()
+	local bytes = ffi.cast("const uint8_t *", data)
+	for y = 0, height - 1 do
+		ffi.copy(rows[y], bytes + y * row_bytes, row_bytes)
+	end
+	return img
+end
+
+-- ---------------------------------------------------------------------------
+-- Process Shot: export frames and launch the bridge
+-- ---------------------------------------------------------------------------
+
+local function write_status(ctx, state, progress, message)
+	write_text(join(ctx.shot, "status.txt"), string.format(
+		"state=%s\nprogress=%.4f\nmessage=%s\nupdated=%d\n", state, progress, message, os.time()))
+end
+
+local function export_and_launch(tool, req, img, ctx, s, request_id)
+	local bridge = join(ctx.root, "resolve", "corridorkey_resolve_bridge.py")
+	if ctx.root == "" or not bmd.fileexists(bridge) then
+		error("CorridorKey folder not set or bridge missing. Set it under Help & Support, "
+			.. "or run resolve/install_resolve_plugin.py")
+	end
+
+	if ctx.python:find("[/\\]") and not bmd.fileexists(ctx.python) then
+		error("Python not found at " .. ctx.python .. ". Set it under Help & Support, "
+			.. "or run resolve/install_resolve_plugin.py")
+	end
+
+	local first, last = tool.Comp.RenderStart, tool.Comp.RenderEnd
+	local count = last - first + 1
+	local width, height = img.Width, img.Height
+	local flags = req:GetFlags()
+	local hint_now = InHint:GetValue(req)
+	local hint_mode = (hint_now ~= nil) and s.hint_mode or "off"
+
+	local input_dir, hint_dir = join(ctx.shot, "input"), join(ctx.shot, "hint")
+	bmd.createdir(input_dir)
+	bmd.createdir(hint_dir)
+	remove_files(input_dir, "*" .. RAW_EXT)
+	remove_files(hint_dir, "*" .. RAW_EXT)
+	os.remove(join(ctx.shot, "cancel"))
+
+	local hint_w, hint_h
+	for i = 0, count - 1 do
+		local t = first + i
+		local frame = (t == req.Time) and img or InImage:GetSource(t, flags)
+		if not frame then
+			error("could not render input frame " .. t)
+		end
+		if frame.Width ~= width or frame.Height ~= height then
+			error(string.format("frame %d is %dx%d but the shot is %dx%d",
+				t, frame.Width, frame.Height, width, height))
+		end
+		write_raw(frame, join(input_dir, string.format("%06d%s", i, RAW_EXT)))
+		if hint_mode == "every" or (hint_mode == "first" and i == 0) then
+			local hint = InHint:GetSource(t, flags)
+			if not hint then
+				error("could not render alpha hint frame " .. t)
+			end
+			hint_w = hint_w or hint.Width
+			hint_h = hint_h or hint.Height
+			write_raw(hint, join(hint_dir, string.format("%06d%s", i, RAW_EXT)))
+		end
+		frame = nil
+		if i % 8 == 7 then
+			collectgarbage()
+			write_status(ctx, "exporting", (i + 1) / count,
+				string.format("Exporting frame %d/%d", i + 1, count))
+		end
+	end
+
+	local job = {
+		version = 1,
+		request = request_id,
+		shot_id = ctx.shot_id,
+		tool_name = ctx.tool_name,
+		ck_root = ctx.root,
+		first_frame = first,
+		num_frames = count,
+		width = width,
+		height = height,
+		input_linear = s.input_linear,
+		model_scale = s.model_scale,
+		memory_mode = s.memory_mode,
+		temporal = s.temporal,
+		hint_mode = hint_mode,
+		hint_channel = s.hint_channel,
+		hint_invert = s.hint_invert,
+		hint_quality = s.hint_quality,
+		hint_width = hint_w,
+		hint_height = hint_h,
+		carry_hint = s.carry_hint,
+		carry_hint_quality = s.carry_hint_quality,
+		test_mode = s.test_mode,
+		signature = signature(s, first, last, width, height, hint_now ~= nil),
+	}
+	local keys = { "version", "request", "shot_id", "tool_name", "ck_root", "first_frame",
+		"num_frames", "width", "height", "input_linear", "model_scale", "memory_mode",
+		"temporal", "hint_mode", "hint_channel", "hint_invert", "hint_quality",
+		"hint_width", "hint_height", "carry_hint", "carry_hint_quality", "test_mode",
+		"signature" }
+	local job_path = join(ctx.shot, "job.json")
+	write_text(job_path, json_object(job, keys))
+	write_status(ctx, "starting", 0, "Starting Python")
+
+	local cmd = quote(ctx.python) .. " " .. quote(bridge) .. " --job " .. quote(job_path)
+	write_text(join(ctx.shot, "launch.txt"), cmd .. "\n")
+	if bmd.executebg then
+		bmd.executebg(cmd)
+	elseif IS_WINDOWS then
+		os.execute('start "" /B ' .. cmd)
+	else
+		os.execute(cmd .. " &")
+	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Status displays
+-- ---------------------------------------------------------------------------
+
+local last_size_check = -1e9
+local last_size_text = "-"
+
+local function set_text(input, value, time)
+	if input:GetSource(time).Value ~= value then
+		input:SetSource(Text(value), 0, 0)
+	end
+end
+
+local function cache_size_text(ctx, force)
+	if force or os.time() - last_size_check > 15 then
+		last_size_check = os.time()
+		local shots, total = 0, 0
+		local entries = bmd.readdir(join(ctx.cache_root, "*"))
+		for _, e in ipairs(entries or {}) do
+			if e.IsDir then
+				shots = shots + 1
+				total = total + folder_size(join(ctx.cache_root, e.Name))
+			end
+		end
+		last_size_text = string.format("%d shot%s, %s", shots, shots == 1 and "" or "s",
+			format_bytes(total))
+	end
+	return last_size_text
+end
+
+local function linear_guess(img)
+	if img.Depth == 5 or img.Depth == 6 or img.Depth == 1 or img.Depth == 2 then
+		return "integer image: probably not linear"
+	end
+	local p = Pixel()
+	local max_v, sum, n = 0, 0, 0
+	for gy = 0, 17 do
+		for gx = 0, 31 do
+			img:GetPixel(math.floor((gx + 0.5) * img.Width / 32),
+				math.floor((gy + 0.5) * img.Height / 18), p)
+			local l = 0.2126 * p.R + 0.7152 * p.G + 0.0722 * p.B
+			max_v = math.max(max_v, p.R, p.G, p.B)
+			sum = sum + l
+			n = n + 1
+		end
+	end
+	local mean = sum / n
+	if max_v > 1.001 then
+		return string.format("values above 1.0 (max %.2f): probably linear", max_v)
+	elseif mean < 0.12 then
+		return string.format("dark (mean %.2f): maybe linear", mean)
+	end
+	return string.format("mean %.2f: probably not linear", mean)
+end
+
+local function vram_text(s, width, height, cache_root, busy)
+	local low = s.memory_mode == "low"
+	local est = estimate_vram(width, height, s.model_scale, s.temporal, low)
+	local text = string.format("%.1f", est)
+	local gpu = read_kv(join(cache_root, "gpu.txt"))
+	if gpu and gpu.total_gb then
+		text = string.format("%s / %.1f / %.1f GB", text, tonumber(gpu.free_gb) or 0,
+			tonumber(gpu.total_gb) or 0)
+	else
+		text = text .. " GB (GPU shown after first run)"
+	end
+	if s.memory_mode == "auto" then
+		text = text .. ", auto"
+	end
+	if busy then
+		text = text .. " (busy)"
+	end
+	return text
+end
+
+local function status_text(status, frame_state)
+	local state = status and status.state or ""
+	local msg = status and status.message or ""
+	if state == "exporting" or state == "starting" or state == "running" then
+		local pct = math.floor((tonumber(status.progress) or 0) * 100 + 0.5)
+		local stale = os.time() - (tonumber(status.updated) or os.time())
+		local text = string.format("processing %d%%: %s", pct, msg)
+		if state == "starting" and stale > 30 and msg == "Starting Python" then
+			return "Python did not start. Check Help & Support > Python, or launch.txt in the cache folder"
+		elseif stale > 120 then
+			text = text .. string.format(" (no update for %ds, see Open Log)", stale)
+		end
+		return text
+	elseif state == "error" then
+		return "error: " .. msg
+	elseif state == "cancelled" then
+		return "cancelled (" .. frame_state .. ")"
+	end
+	return frame_state
+end
+
+-- ---------------------------------------------------------------------------
+-- Render
+-- ---------------------------------------------------------------------------
+
+local function apply_output(req, res, src, out_depth)
+	local out = new_image(src.Width, src.Height, out_depth, src)
+	local node = DVIPComputeNode(req, "CKOutputKernel", CKOutputKernel, "CKOutputParams", CKOutputParams)
+	if not node then
+		return nil
+	end
+	local params = node:GetParamBlock(CKOutputParams)
+	local colour = InDespillColour:GetValue(req).Value
+	local auto_blue = res.screen_colour == "blue"
+	params.size[0] = out.Width
+	params.size[1] = out.Height
+	params.mode = InOutput:GetValue(req).Value
+	params.despillBlue = (colour == 2 or (colour == 0 and auto_blue)) and 1 or 0
+	params.despillAlgo = InDespillAlgo:GetValue(req).Value
+	params.despillAmount = InDespillAmount:GetValue(req).Value
+	params.blackPoint = InBlack:GetValue(req).Value
+	params.whitePoint = InWhite:GetValue(req).Value
+	params.compOrder = 15
+	node:SetParamBlock(params)
+	node:AddInput("res", res.image)
+	node:AddInput("src", src)
+	node:AddOutput("dst", out)
+	if not node:RunSession(req) then
+		return nil
+	end
+	return out
+end
+
+function Process(req)
+	local img = InImage:GetValue(req)
+	if req:IsPreCalc() then
+		OutImage:Set(req, Image({ IMG_Like = img, IMG_NoData = true }))
+		return
+	end
+
+	local time = req.Time
+	local ctx = context(self, time)
+	local s = settings(req)
+	bmd.createdir(ctx.shot)
+
+	-- A pending request file means Process Shot was pressed (see NotifyChanged).
+	local pending = join(ctx.shot, "request.pending")
+	local pf = io.open(pending, "r")
+	if pf then
+		local request_id = tonumber(pf:read("*l")) or os.time()
+		pf:close()
+		os.remove(pending)
+		local ok, err = pcall(export_and_launch, self, req, img, ctx, s, request_id)
+		if not ok then
+			write_status(ctx, "error", 0, tostring(err):gsub("\n", " "))
+		end
+		last_size_check = -1e9
+	end
+
+	local status = read_kv(join(ctx.shot, "status.txt"))
+	local meta = read_kv(join(ctx.shot, "result", "meta.txt"))
+	local out, frame_state = nil, "not processed: press Process Shot"
+
+	if meta then
+		local index = time - (tonumber(meta.first_frame) or 0)
+		local width, height = tonumber(meta.width), tonumber(meta.height)
+		if index < 0 or index >= (tonumber(meta.num_frames) or 0) then
+			frame_state = "frame outside processed range: showing input"
+		else
+			local path = join(ctx.shot, "result", string.format("%06d%s", index, RAW_EXT))
+			local res = read_raw(path, width, height, img)
+			if res and (res.Width ~= img.Width or res.Height ~= img.Height) then
+				local resized = new_image(img.Width, img.Height, 7, img)
+				res:Resize(resized, { RSZ_Filter = "Linear", RSZ_Width = img.Width, RSZ_Height = img.Height })
+				res = resized
+			end
+			if res then
+				local src = to_half_rgba(img)
+				local depth = (img.Depth == 4 or img.Depth == 8) and 8 or 7
+				out = apply_output(req, { image = res, screen_colour = meta.screen_colour }, src, depth)
+				frame_state = out and "keyed (cached, no re-render)" or "error: GPU output kernel failed"
+			else
+				frame_state = "result missing for this frame: process the shot again"
+			end
+		end
+	end
+
+	-- Status displays (passive inputs, so updating them does not re-render).
+	local busy = status and (status.state == "running" or status.state == "exporting"
+		or status.state == "starting")
+	set_text(InStatus, status_text(status, frame_state), time)
+	set_text(InVRAM, vram_text(s, img.Width, img.Height, ctx.cache_root, busy), time)
+	set_text(InLinearGuess, linear_guess(img), time)
+	set_text(InCacheSize, cache_size_text(ctx, false), time)
+	local processed = "not processed"
+	if meta then
+		processed = string.format("%s frames %d-%d, %sx%s, %ss, %s",
+			meta.num_frames, tonumber(meta.first_frame) or 0,
+			(tonumber(meta.first_frame) or 0) + (tonumber(meta.num_frames) or 1) - 1,
+			meta.width, meta.height, meta.elapsed or "?", meta.finished or "")
+		local hint_connected = InHint:GetValue(req) ~= nil
+		local sig = signature(s, tonumber(meta.first_frame) or 0,
+			(tonumber(meta.first_frame) or 0) + (tonumber(meta.num_frames) or 1) - 1,
+			tonumber(meta.width) or 0, tonumber(meta.height) or 0, hint_connected)
+		if sig ~= meta.signature then
+			processed = "settings changed since last run: Process Shot again. Last run: " .. processed
+		end
+		if meta.test_mode == "1" then
+			processed = processed .. " (test mode)"
+		end
+	end
+	set_text(InProcessed, processed, time)
+
+	OutImage:Set(req, out or img)
+end
+
+-- ---------------------------------------------------------------------------
+-- Buttons
+-- ---------------------------------------------------------------------------
+
+function NotifyChanged(inp, param, time)
+	if param == nil or param.Value ~= 1 then
+		if inp == InCacheFolder then
+			last_size_check = -1e9
+		end
+		return
+	end
+	local ctx = context(self, time)
+
+	if inp == InProcess then
+		bmd.createdir(ctx.shot)
+		local id = os.time()
+		write_text(join(ctx.shot, "request.pending"), tostring(id) .. "\n")
+		write_status(ctx, "starting", 0, "Waiting for the node to render (view it to start)")
+		InProcessReq:SetSource(Number(InProcessReq:GetSource(time).Value + 1), 0, 0)
+	elseif inp == InCancel then
+		write_text(join(ctx.shot, "cancel"), "cancel\n")
+		os.remove(join(ctx.shot, "request.pending"))
+		InResultStamp:SetSource(Number(InResultStamp:GetSource(time).Value + 1), 0, 0)
+	elseif inp == InReload then
+		last_size_check = -1e9
+		InResultStamp:SetSource(Number(InResultStamp:GetSource(time).Value + 1), 0, 0)
+	elseif inp == InOpenCache then
+		bmd.createdir(ctx.cache_root)
+		open_external(ctx.cache_root)
+	elseif inp == InOpenLog then
+		local log = join(ctx.shot, "log.txt")
+		if bmd.fileexists(log) then
+			open_external(log)
+		end
+	elseif inp == InOpenDocs then
+		local doc = join(ctx.root, "resolve", "README.md")
+		if bmd.fileexists(doc) then
+			open_external(doc)
+		end
+	elseif inp == InFreeze then
+		local meta = read_kv(join(ctx.shot, "result", "meta.txt"))
+		if meta and meta.screen_colour then
+			InDespillColour:SetSource(Number(meta.screen_colour == "blue" and 2 or 1), 0, 0)
+		end
+	end
+end
